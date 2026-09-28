@@ -60,14 +60,15 @@ def groups(features, positions, count, appearance=False):
         return identity, identity
     xy = positions.float()
     xy = (xy - xy.amin(0)) / (xy.amax(0) - xy.amin(0)).clamp_min(1)
-    seeds = [0]
+    seeds = torch.empty(count, dtype=torch.long, device=features.device)
+    seeds[0] = 0
     distance = (xy - xy[0]).square().sum(-1)
-    for _ in range(1, count):
-        distance[seeds] = -1
-        next_seed = int(distance.argmax())
-        seeds.append(next_seed)
-        distance = torch.minimum(distance, (xy - xy[next_seed]).square().sum(-1))
-    seeds = torch.tensor(seeds, device=features.device)
+    for index in range(1, count):
+        distance[seeds[:index]] = -1
+        next_seed = distance.argmax()
+        seeds[index] = next_seed
+        point = xy.index_select(0, next_seed.reshape(1))
+        distance = torch.minimum(distance, (xy - point).square().sum(-1))
     cost = (xy[:, None] - xy[seeds][None]).square().sum(-1)
     if appearance:
         normalized = F.normalize(features.float(), dim=-1)
@@ -254,9 +255,11 @@ class ResearchCache:
                     can_merge = count < patches
                     if not can_merge and key == 0:
                         continue  # protect anchor presence, not its spatial resolution
-                    token_bytes = (nbytes(row) - nbytes(row['descriptor'])) // len(row['mass'])
-                    released = ((patches - count) * token_bytes if can_merge else nbytes(row))
-                    score = self._novelty(key) / released
+                    score = 0.
+                    if config.allocation == 'coverage':
+                        token_bytes = (nbytes(row) - nbytes(row['descriptor'])) // len(row['mass'])
+                        released = ((patches - count) * token_bytes if can_merge else nbytes(row))
+                        score = self._novelty(key) / released
                     choices.append((score, key, count if can_merge else 0))
                 assert choices, 'Budget cannot fit recent frames plus anchor summaries'
                 if config.allocation == 'coverage':
@@ -302,7 +305,7 @@ class ResearchCache:
                 energy = sum(old.float().square().sum() for pair in row['kv'] for old in pair)
                 scores[key] = float(difference / energy.clamp_min(1e-12))
                 del candidate
-        else:
+        elif config.refresh == 'selective':
             for key in candidates:
                 row = self.records[key]
                 affinity = ((current @ row['descriptor']) + 1).clamp(0, 2) / 2
