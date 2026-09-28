@@ -17,6 +17,7 @@ class ResearchConfig:
     frame_budget: int = 8
     context: str = 'appearance'
     context_tokens: int = 64
+    context_probe: bool = False
     budget_frames: int = 8
     recent_frames: int = 2
     min_patches: int = 16
@@ -35,6 +36,7 @@ class ResearchConfig:
         assert self.budget_frames > self.recent_frames >= 1
         assert self.min_patches >= 1 and self.refresh_every >= 1
         assert 1 <= self.refresh_frames < self.frame_budget
+        assert not self.context_probe or (self.method == 'context' and self.context == 'dense')
 
 
 def nbytes(value):
@@ -117,7 +119,7 @@ def context_tokens(patches, positions, foreground, count, mode):
 class ResearchCache:
     """One causal stream. Historical refresh changes future reads, never past poses."""
 
-    def __init__(self, aggregator, config):
+    def __init__(self, aggregator, config, observer=None):
         assert not aggregator.training
         assert aggregator.aa_order == ['frame', 'global'] and aggregator.aa_block_size == 1
         assert aggregator.rope is not None
@@ -127,6 +129,8 @@ class ResearchCache:
         self.byte_budget = None
         self.generator = torch.Generator().manual_seed(config.seed)
         self.last_frame = -1
+        self.observer = observer
+        assert observer is None or (config.method == 'context' and config.context == 'dense')
 
     def _global(self, block, tokens, pos, layer, exclude):
         attention = block.attn
@@ -144,6 +148,9 @@ class ResearchCache:
         key_pos = torch.cat([record['positions'] for record in old] + [pos], 1)
         q, keys = attention.q_norm(q), attention.k_norm(keys)
         q, keys = attention.rope(q, pos), attention.rope(keys, key_pos)
+        if self.observer is not None:
+            self.observer.observe(block, tokens, pos, layer, q, keys, values,
+                                  list(self.records))
         result = F.scaled_dot_product_attention(q, keys, values, dropout_p=0.)
         result = result.transpose(1, 2).reshape(batch, count, channels)
         tokens = tokens + block.ls1(attention.proj_drop(attention.proj(result)))
@@ -181,6 +188,8 @@ class ResearchCache:
             assert mask.shape == image.shape[-2:] and mask.dtype == torch.bool
             foreground = F.max_pool2d(mask[None, None].float().to(image.device),
                                       model.patch_size, model.patch_size).flatten().bool()
+            if self.observer is not None:
+                self.observer.begin(frame, patches, positions, foreground)
             patches, positions, inverse = context_tokens(
                 patches, positions, foreground, self.config.context_tokens, self.config.context)
         kind = int(frame != 0)
@@ -283,6 +292,8 @@ class ResearchCache:
         self.event['patches_per_frame'] = {str(key): len(row['mass']) - self.special
                                           for key, row in self.records.items()}
         self.event['state_budget_bytes'] = self.byte_budget if config.method == 'temporal' else None
+        if self.observer is not None:
+            self.observer.prune(list(self.records))
         return self.event
 
     def refresh(self, frame):
