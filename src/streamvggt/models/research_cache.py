@@ -19,6 +19,7 @@ class ResearchConfig:
     context_tokens: int = 64
     context_probe: bool = False
     context_mass: bool = False
+    context_mass_scope: str = 'both'
     budget_frames: int = 8
     recent_frames: int = 2
     min_patches: int = 16
@@ -39,6 +40,8 @@ class ResearchConfig:
         assert 1 <= self.refresh_frames < self.frame_budget
         assert not self.context_probe or (self.method == 'context' and self.context == 'dense')
         assert not self.context_mass or (self.method == 'context' and self.context in ('spatial', 'dense'))
+        assert self.context_mass_scope in ('both', 'frame', 'global')
+        assert self.context_mass or self.context_mass_scope == 'both'
 
 
 def nbytes(value):
@@ -154,7 +157,7 @@ class ResearchCache:
             self.observer.observe(block, tokens, pos, layer, q, keys, values,
                                   list(self.records))
         bias = None
-        if self.config.context_mass:
+        if self.config.context_mass and self.config.context_mass_scope in ('both', 'global'):
             bias = torch.cat([record['mass'] for record in old] + [mass]).log().to(q.dtype)[None, None, None]
         result = F.scaled_dot_product_attention(q, keys, values, attn_mask=bias, dropout_p=0.)
         result = result.transpose(1, 2).reshape(batch, count, channels)
@@ -164,10 +167,11 @@ class ResearchCache:
 
     def _aggregate(self, tokens, positions, exclude=None, outputs=True, mass=None):
         cache, result = [], []
-        bias = mass.log().to(tokens.dtype)[None, None, None] if self.config.context_mass else None
+        correct_frame = self.config.context_mass and self.config.context_mass_scope in ('both', 'frame')
+        bias = mass.log().to(tokens.dtype)[None, None, None] if correct_frame else None
         for layer, (frame_block, global_block) in enumerate(
                 zip(self.model.frame_blocks, self.model.global_blocks)):
-            if self.config.context_mass:
+            if correct_frame:
                 local = frame_block(tokens, pos=positions, attn_mask=bias)
             else:
                 local = frame_block(tokens, pos=positions)
