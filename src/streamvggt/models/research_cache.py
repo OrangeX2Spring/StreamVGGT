@@ -18,6 +18,7 @@ class ResearchConfig:
     context: str = 'appearance'
     context_tokens: int = 64
     context_probe: bool = False
+    context_mass: bool = False
     budget_frames: int = 8
     recent_frames: int = 2
     min_patches: int = 16
@@ -37,6 +38,7 @@ class ResearchConfig:
         assert self.min_patches >= 1 and self.refresh_every >= 1
         assert 1 <= self.refresh_frames < self.frame_budget
         assert not self.context_probe or (self.method == 'context' and self.context == 'dense')
+        assert not self.context_mass or (self.method == 'context' and self.context in ('spatial', 'dense'))
 
 
 def nbytes(value):
@@ -132,7 +134,7 @@ class ResearchCache:
         self.observer = observer
         assert observer is None or (config.method == 'context' and config.context == 'dense')
 
-    def _global(self, block, tokens, pos, layer, exclude):
+    def _global(self, block, tokens, pos, layer, exclude, mass=None):
         attention = block.attn
         assert attention.fused_attn and not attention.training
         batch, count, channels = tokens.shape
@@ -151,18 +153,25 @@ class ResearchCache:
         if self.observer is not None:
             self.observer.observe(block, tokens, pos, layer, q, keys, values,
                                   list(self.records))
-        result = F.scaled_dot_product_attention(q, keys, values, dropout_p=0.)
+        bias = None
+        if self.config.context_mass:
+            bias = torch.cat([record['mass'] for record in old] + [mass]).log().to(q.dtype)[None, None, None]
+        result = F.scaled_dot_product_attention(q, keys, values, attn_mask=bias, dropout_p=0.)
         result = result.transpose(1, 2).reshape(batch, count, channels)
         tokens = tokens + block.ls1(attention.proj_drop(attention.proj(result)))
         tokens = tokens + block.ls2(block.mlp(block.norm2(tokens)))
         return tokens, fresh
 
-    def _aggregate(self, tokens, positions, exclude=None, outputs=True):
+    def _aggregate(self, tokens, positions, exclude=None, outputs=True, mass=None):
         cache, result = [], []
+        bias = mass.log().to(tokens.dtype)[None, None, None] if self.config.context_mass else None
         for layer, (frame_block, global_block) in enumerate(
                 zip(self.model.frame_blocks, self.model.global_blocks)):
-            local = frame_block(tokens, pos=positions)
-            tokens, pair = self._global(global_block, local, positions, layer, exclude)
+            if self.config.context_mass:
+                local = frame_block(tokens, pos=positions, attn_mask=bias)
+            else:
+                local = frame_block(tokens, pos=positions)
+            tokens, pair = self._global(global_block, local, positions, layer, exclude, mass)
             cache.append(pair)
             if outputs:
                 result.append(torch.cat((local, tokens), -1)[:, None])
@@ -197,9 +206,12 @@ class ResearchCache:
         tokens = torch.cat((special_tokens, patches), 1)
         positions = torch.cat((torch.zeros(1, self.special, 2, device=image.device,
                                           dtype=positions.dtype), positions), 1)
-        output, cache = self._aggregate(tokens, positions)
+        mass = torch.ones(tokens.shape[1], device=image.device)
+        if self.config.method == 'context':
+            mass[self.special:] = torch.bincount(inverse, minlength=patches.shape[1]).to(mass.dtype)
+        output, cache = self._aggregate(tokens, positions, mass=mass)
         record = dict(kv=cache, positions=positions, descriptor=descriptor,
-                      mass=torch.ones(tokens.shape[1], device=image.device))
+                      mass=mass)
         if self.config.method == 'refresh':
             # Auxiliary embeddings are real persistent storage, included in bytes.
             record['seed_tokens'] = tokens.detach().clone()
@@ -223,6 +235,7 @@ class ResearchCache:
         if self.config.method == 'context':
             self.event['dense_to_sparse'] = inverse.tolist()
             self.event['representative_positions'] = positions[0, self.special:].tolist()
+            self.event['token_mass'] = mass.tolist()
         return output
 
     def _compress(self, frame, count):
