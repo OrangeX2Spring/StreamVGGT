@@ -20,11 +20,18 @@ def storage_bytes(values):
 
 
 class DepthCache:
-    def __init__(self, aggregator, mode='native', omitted=(), capacity=32, history_policy='fifo'):
+    def __init__(self, aggregator, mode='native', omitted=(), capacity=32, history_policy='fifo',
+                 frame_equivalents=None):
         assert not aggregator.training and aggregator.aa_block_size == 1
-        assert mode in ('native', 'omit', 'uniform_special')
+        assert mode in ('native', 'omit', 'uniform_special', 'online', 'budget_uniform')
+        assert (frame_equivalents is not None) == (mode in ('online', 'budget_uniform'))
+        assert frame_equivalents is None or 2 <= frame_equivalents <= capacity
+        self.frame_equivalents = frame_equivalents
+        self.scores = [1.] * aggregator.depth
+        self.probes = []
         assert capacity > 0
         assert history_policy in ('fifo', 'anchor')
+        assert frame_equivalents is None or history_policy == 'anchor'
         assert history_policy != 'anchor' or capacity >= 2
         self.model, self.mode = aggregator, mode
         self.omitted = tuple(sorted(omitted))
@@ -59,12 +66,23 @@ class DepthCache:
                 q = attention.rope(q, pos)
                 keys = attention.rope(keys, key_pos)
                 result = F.scaled_dot_product_attention(q, keys, v, dropout_p=0.)
+                if self.mode == 'online' and self.frame % 16 == 0 and len(self.frames) > 2:
+                    from kv_tracker.online_layer_cache import sensitivity
+                    slots = torch.linspace(0, count - 1, min(8, count), device=q.device).round().long()
+                    ids = self.ids[layer] // count
+                    protected = (ids == 0) | (ids == self.frames[-1]) | (ids == self.frame)
+                    score = sensitivity(q[:, :, slots], keys, v, protected)
+                    self.scores[layer] = .9 * self.scores[layer] + .1 * score
+                    self.probes.append(dict(frame=self.frame, layer=layer, score=score,
+                                            smoothed=self.scores[layer], queries=len(slots)))
                 result = result.transpose(1, 2).reshape(batch, count, channels)
                 return attention.proj_drop(attention.proj(result)), pair
             block.attn.forward = MethodType(forward, block.attn)
         self.reset()
 
     def reset(self):
+        self.scores = [1.] * self.model.depth
+        self.probes = []
         self.cache = [None] * self.model.depth
         self.positions = [None] * self.model.depth
         device = self.model.camera_token.device
@@ -90,6 +108,8 @@ class DepthCache:
                 self.frames = frames[:1] + frames[-(self.capacity - 1):]
             else:
                 self.frames = frames[-self.capacity:]
+        if self.mode in ('online', 'budget_uniform'):
+            return self.retain_budget()
         total = (self.model.depth - len(self.omitted)) * self.tokens
         base, remainder = divmod(total, self.model.depth)
         for layer, pair in enumerate(self.cache):
@@ -123,6 +143,39 @@ class DepthCache:
                     kv_bytes=storage_bytes(self.cache), positions_bytes=storage_bytes(self.positions),
                     ids_bytes=storage_bytes(self.ids), dense_equivalent_bytes=
                     len(self.frames) * self.model.depth * self.tokens * per_row)
+
+    def retain_budget(self):
+        from kv_tracker.patch_select import allocate
+        eligible, protected = [], []
+        for ids in self.ids:
+            frames = ids // self.tokens
+            eligible.append(torch.isin(frames, torch.tensor(self.frames, device=ids.device)))
+            protected.append(eligible[-1] & ((frames == 0) | (frames == self.frames[-1])))
+        floors = [int(mask.sum()) for mask in protected]
+        rooms = [int(mask.sum()) - floor for mask, floor in zip(eligible, floors)]
+        target = min(self.frame_equivalents * self.tokens * self.model.depth,
+                     sum(floors) + sum(rooms))
+        weights = [s ** .5 for s in self.scores] if self.mode == 'online' else [1.] * self.model.depth
+        quota = allocate(target - sum(floors), rooms, weights).tolist()
+        for layer, extra in enumerate(quota):
+            free = (eligible[layer] & ~protected[layer]).nonzero().flatten()
+            slots = torch.linspace(0, len(free) - 1, extra, device=free.device).round().long()
+            selected = torch.cat((protected[layer].nonzero().flatten(), free[slots])).sort().values
+            self.cache[layer] = tuple(t.index_select(3, selected) for t in self.cache[layer])
+            self.positions[layer] = self.positions[layer].index_select(1, selected)
+            self.ids[layer] = self.ids[layer].index_select(0, selected)
+        pair = self.cache[0][0]
+        kv_per_row = 2 * pair.shape[0] * pair.shape[1] * pair.shape[-1] * pair.element_size()
+        per_row = kv_per_row + 24
+        actual = storage_bytes((self.cache, self.positions, self.ids))
+        assert actual == target * per_row
+        limit = self.frame_equivalents * self.tokens * self.model.depth * per_row
+        assert actual <= limit
+        return dict(frame=self.frame, history_frames=list(self.frames),
+                    layer_rows=[len(ids) for ids in self.ids], persistent_bytes=actual,
+                    budget_bytes=limit, kv_bytes=storage_bytes(self.cache),
+                    positions_bytes=storage_bytes(self.positions), ids_bytes=storage_bytes(self.ids),
+                    scores=list(self.scores), protected_rows=floors)
 
     def close(self):
         for block, original in zip(self.model.global_blocks, self.originals):
