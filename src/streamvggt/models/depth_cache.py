@@ -20,15 +20,18 @@ def storage_bytes(values):
 
 
 class DepthCache:
-    def __init__(self, aggregator, mode='native', omitted=(), capacity=32):
+    def __init__(self, aggregator, mode='native', omitted=(), capacity=32, history_policy='fifo'):
         assert not aggregator.training and aggregator.aa_block_size == 1
         assert mode in ('native', 'omit', 'uniform_special')
         assert capacity > 0
+        assert history_policy in ('fifo', 'anchor')
+        assert history_policy != 'anchor' or capacity >= 2
         self.model, self.mode = aggregator, mode
         self.omitted = tuple(sorted(omitted))
         assert len(set(self.omitted)) == len(self.omitted)
         assert all(0 <= i < aggregator.depth for i in self.omitted)
         self.capacity = capacity
+        self.history_policy = history_policy
         self.originals = [block.attn.forward for block in aggregator.global_blocks]
         for layer, block in enumerate(aggregator.global_blocks):
             def forward(attention, x, pos=None, attn_mask=None, past_key_values=None,
@@ -82,7 +85,11 @@ class DepthCache:
     def retain(self, admit):
         """Filter only after the current query; fixed per-frame equal-row budgets."""
         if admit:
-            self.frames = (self.frames + [self.frame])[-self.capacity:]
+            frames = self.frames + [self.frame]
+            if self.history_policy == 'anchor' and len(frames) > self.capacity:
+                self.frames = frames[:1] + frames[-(self.capacity - 1):]
+            else:
+                self.frames = frames[-self.capacity:]
         total = (self.model.depth - len(self.omitted)) * self.tokens
         base, remainder = divmod(total, self.model.depth)
         for layer, pair in enumerate(self.cache):
