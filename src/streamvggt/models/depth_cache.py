@@ -25,9 +25,9 @@ class DepthCache:
         assert not aggregator.training and aggregator.aa_block_size == 1
         assert mode in ('native', 'omit', 'uniform_special', 'online', 'budget_uniform')
         assert (frame_equivalents is not None) == (mode in ('online', 'budget_uniform'))
-        assert frame_equivalents is None or 2 <= frame_equivalents <= capacity
+        assert frame_equivalents is None or 3 <= frame_equivalents <= capacity
         self.frame_equivalents = frame_equivalents
-        self.scores = [1.] * aggregator.depth
+        self.scores = [0.] * aggregator.depth
         self.probes = []
         assert capacity > 0
         assert history_policy in ('fifo', 'anchor')
@@ -81,7 +81,7 @@ class DepthCache:
         self.reset()
 
     def reset(self):
-        self.scores = [1.] * self.model.depth
+        self.scores = [0.] * self.model.depth
         self.probes = []
         self.cache = [None] * self.model.depth
         self.positions = [None] * self.model.depth
@@ -145,7 +145,7 @@ class DepthCache:
                     len(self.frames) * self.model.depth * self.tokens * per_row)
 
     def retain_budget(self):
-        from kv_tracker.patch_select import allocate
+        from kv_tracker.online_layer_cache import budget_quotas
         eligible, protected = [], []
         for ids in self.ids:
             frames = ids // self.tokens
@@ -156,7 +156,7 @@ class DepthCache:
         target = min(self.frame_equivalents * self.tokens * self.model.depth,
                      sum(floors) + sum(rooms))
         weights = [s ** .5 for s in self.scores] if self.mode == 'online' else [1.] * self.model.depth
-        quota = allocate(target - sum(floors), rooms, weights).tolist()
+        quota = budget_quotas(target - sum(floors), rooms, weights)
         for layer, extra in enumerate(quota):
             free = (eligible[layer] & ~protected[layer]).nonzero().flatten()
             slots = torch.linspace(0, len(free) - 1, extra, device=free.device).round().long()
